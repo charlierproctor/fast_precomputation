@@ -195,8 +195,10 @@ class DataChangeset(object):
                 # fake the change (incrementing the change_idx)
                 with item.fake_change():
 
-                    # assess the joint probability of these new values
-                    probabilities.append(self.joint_probability())
+                    # assess the joint probability of changing to new values
+                    probabilities.append(
+                        joint_probability(changes=self.changes)
+                    )
 
             else:
                 probabilities.append(0)
@@ -209,12 +211,19 @@ class DataChangeset(object):
         return False
 
     @staticmethod
-    def important_datasets(fis, data, skip=set()):
+    def important_datasets(fis, data):
         """
-        Yield datasets in decreasing order of importance,
-        where *importance* is the number of dependent function instances
-        skip: datasets to skip (not yield)
+        Yield datasets in decreasing order of changeset_weight
         """
+
+        def changeset_weight(changeset):
+            return (
+                # probability that other items remain constant
+                joint_probability(constants=(data - changeset))
+
+                # importance of changing these items
+                * importance(changeset)
+            )
 
         def important_changesets_generator(fis):
             if len(fis) == 0:
@@ -235,23 +244,37 @@ class DataChangeset(object):
                     # exclude this function instance
                     changesets.append(changeset)
 
-                    changesets.sort(
-                        key=lambda changeset: (
-                            # probability that other items remain constant
-                            joint_probability(constants=(data - changeset))
-
-                            # importance of changing these items
-                            * importance(changeset)
-                        ),
-                        reverse=True,
-                    )
+                    changesets.sort(key=changeset_weight, reverse=True)
                     for changeset in changesets:
                         yield changeset
 
+        def create_data_changesets(lst):
+            return frozenset([
+                DataChangeset(data - changeset, changeset)
+                for changeset in lst
+            ])
+
+        skip = set()
+        to_yield = []
+
         for changeset in important_changesets_generator(list(fis)):
-            if changeset not in skip:
-                skip.add(changeset)
-                yield DataChangeset(data - changeset, changeset)
+
+            # skip this changeset
+            if changeset in skip:
+                continue
+            skip.add(changeset)
+
+            # yield to_yield if we've encountered a new changeset_weight
+            if (len(to_yield) > 0
+                and changeset_weight(to_yield[-1])
+                    != changeset_weight(changeset)):
+                yield create_data_changesets(to_yield)
+                to_yield = []
+
+            to_yield.append(changeset)
+
+        if len(to_yield) > 0:
+            yield create_data_changesets(to_yield)
 
     @classmethod
     def generate(cls, fis, data):
@@ -259,7 +282,7 @@ class DataChangeset(object):
         enumerate all possible permutations of changes on the data items
         """
         dataset_iterator = cls.important_datasets(fis, data)
-        active_changesets = [next(dataset_iterator)]
+        active_changesets = list(next(dataset_iterator))
 
         while len(active_changesets) > 0:
 
@@ -275,9 +298,9 @@ class DataChangeset(object):
             if best_changeset.weight() > 0:
                 yield best_changeset
 
-            # if this is the last changeset, add another to the mix
+            # if this is the last changeset, add more to the mix
             if best_idx == len(active_changesets) - 1:
-                active_changesets.append(next(dataset_iterator))
+                active_changesets += list(next(dataset_iterator))
 
             # make another change to this changeset for the future
             if not best_changeset.change():
@@ -317,3 +340,6 @@ if __name__ == '__main__':
                 changeset.weight(),
             )
         )
+        if old_weight > 0:
+            assert changeset.weight() <= old_weight
+        old_weight = changeset.weight()
