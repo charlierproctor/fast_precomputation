@@ -225,14 +225,17 @@ class DataChangeset(object):
                 * importance(changeset)
             )
 
-        def important_changesets_generator(fis):
+        def important_changesets_generator(fis, depth=0):
             if len(fis) == 0:
-                yield frozenset()
+                yield [frozenset()]
             else:
                 # recursively generate changesets
-                for changeset in important_changesets_generator(fis[1:]):
+                for changeset_group in important_changesets_generator(
+                    fis[1:],
+                    depth=depth + 1,
+                ):
 
-                    # goal: yield in decreasing order of
+                    # goal: yield in decreasing order of changeset_weight:
                     # joint_probability(constants remaining current value)
                     # * importance(other items changing)
 
@@ -240,41 +243,41 @@ class DataChangeset(object):
                         # change data this function instance depends on
                         frozenset(set({dependent_data_item}) | changeset)
                         for dependent_data_item in fis[0].data
+                        for changeset in changeset_group
                     ]
                     # exclude this function instance
-                    changesets.append(changeset)
+                    changesets += list(changeset_group)
 
                     changesets.sort(key=changeset_weight, reverse=True)
+
+                    # yield the changesets in groups of the same weight
+                    to_yield = []
                     for changeset in changesets:
-                        yield changeset
+                        if (
+                            len(to_yield) > 0
+                            and changeset_weight(changeset)
+                            < changeset_weight(to_yield[-1])
+                        ):
+                            yield set(to_yield)
+                            to_yield = []
+                        to_yield.append(changeset)
+                    yield set(to_yield)
 
-        def create_data_changesets(lst):
-            return frozenset([
-                DataChangeset(data - changeset, changeset)
-                for changeset in lst
-            ])
-
+        # skip changesets that have already been yielded
         skip = set()
-        to_yield = []
+        old_weight = 10000
+        for changesets in important_changesets_generator(list(fis)):
+            for y in changesets:
+                assert changeset_weight(y) < old_weight
+            old_weight = changeset_weight(list(changesets)[-1])
 
-        for changeset in important_changesets_generator(list(fis)):
+            changesets -= skip
+            skip |= changesets
 
-            # skip this changeset
-            if changeset in skip:
-                continue
-            skip.add(changeset)
-
-            # yield to_yield if we've encountered a new changeset_weight
-            if (len(to_yield) > 0
-                and changeset_weight(to_yield[-1])
-                    != changeset_weight(changeset)):
-                yield create_data_changesets(to_yield)
-                to_yield = []
-
-            to_yield.append(changeset)
-
-        if len(to_yield) > 0:
-            yield create_data_changesets(to_yield)
+            yield frozenset([
+                DataChangeset(data - changeset, changeset)
+                for changeset in changesets
+            ])
 
     @classmethod
     def generate(cls, fis, data):
