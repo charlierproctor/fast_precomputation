@@ -10,14 +10,21 @@ NUM_ITEMS = 3
 class FunctionInstance(object):
 
     def __init__(self):
-        self.data = set()
+        self._data = set()
 
     def depends_on(self, data_item):
         """
         mark this function instance as dependent on *data_item*
         """
-        self.data.add(data_item)
+        self._data.add(data_item)
         data_item.dependent_fi.add(self)
+
+    @property
+    def data(self):
+        """
+        immutable version of the data (and thus hashable)
+        """
+        return frozenset(self._data)
 
 
 class DataItem(object):
@@ -30,7 +37,10 @@ class DataItem(object):
         self.dependent_fi = set()
 
     def __repr__(self):
-        return "item({})".format(self.idx.__repr__())
+        return "item(idx={}, value={})".format(
+            repr(self.idx),
+            repr(self.value),
+        )
 
     def probability(self, value):
         """
@@ -57,84 +67,121 @@ class DataItem(object):
         return self._possible_changes
 
 
-class DataChangeset(object):
+def joint_probability(constants=None, changes=None):
+    """
+    joint probability of this dataset (with the current values) occurring
+    assume data change events are independent
+    """
+    prob = 1
 
-    class ChangedDataItem(object):
+    # constant items remain unchanged (thus keeping their old probability)
+    if constants is not None:
+        for constant in constants:
+            prob *= constant.probability(constant.value)
 
-        def __init__(self, item):
-            self.item = item
-            self.change_idx = 0
+    # change the changed items to the changed_value
+    if changes is not None:
+        for change in changes:
+            prob *= change.probability(change.changed_value)
 
-        def __repr__(self):
-            return repr(self.item) + " = " + str(self.current_value)
+    return prob
 
-        @property
-        def current_value(self):
-            """
-            what is the current value of the associated item?
-            """
-            return self.item.possible_changes[self.change_idx]
 
-        @contextmanager
-        def fake_change(self):
-            """
-            increase, yield, decrease change_idx
-            """
-            self.change_idx += 1
-            yield
-            self.change_idx -= 1
+def importance(changes=None):
+    """
+    importance is given by the total number of dependent function instances
+    of the associated changing items
+    """
+    dependent_fis = set()
+    if changes is not None:
+        for change in changes:
+            dependent_fis |= change.dependent_fi
+    return len(dependent_fis)
 
-        def can_change(self):
-            """
-            whether this item has another change to assess
-            """
-            return self.change_idx < len(self.item.possible_changes) - 1
 
-        def change(self):
-            """
-            go ahead and perform the change
-            """
-            self.change_idx += 1
+def weight(constants=None, changes=None):
+    """
+    weight of this changeset taking the current values
+    """
+    return (
+        importance(changes) * joint_probability(constants, changes)
+    )
 
-    def __init__(self, changing_items):
-        self.changing_items = changing_items
-        self.changes = [self.ChangedDataItem(item) for item in changing_items]
+
+class ChangedDataItem(DataItem):
+
+    def __init__(self, idx, value):
+        super(ChangedDataItem, self).__init__(idx, value)
+
+        self.change_idx = 0
+
+    @classmethod
+    def from_(cls, data_item):
+        obj = cls(data_item.idx, data_item.value)
+        obj.dependent_fi = data_item.dependent_fi
+        return obj
 
     def __repr__(self):
-        return repr(self.changes) + \
-            " prob={:.2f}, importance={}, weight={:.2f}".format(
-                self.joint_probability(),
-                self.importance(),
-                self.weight(),
-            )
+        return "change(" + super(ChangedDataItem, self).__repr__() \
+            + " ==> " + str(self.changed_value) + ")"
+
+    @property
+    def changed_value(self):
+        """
+        what is the current value of the associated item?
+        """
+        return self.possible_changes[self.change_idx]
+
+    @contextmanager
+    def fake_change(self):
+        """
+        increase, yield, decrease change_idx
+        """
+        self.change_idx += 1
+        yield
+        self.change_idx -= 1
+
+    def can_change(self):
+        """
+        whether this item has another change to assess
+        """
+        return self.change_idx < len(self.possible_changes) - 1
+
+    def change(self):
+        """
+        go ahead and perform the change
+        """
+        self.change_idx += 1
+
+
+class DataChangeset(object):
+
+    def __init__(self, constants=None, changes=None):
+        constants = frozenset() if constants is None else constants
+        changes = frozenset() if changes is None else changes
+
+        # sanity checks: sets are disjoint and contain data items
+        assert constants.isdisjoint(changes)
+        for item in constants | changes:
+            assert isinstance(item, DataItem)
+
+        self.constants = constants
+        self.changes = [ChangedDataItem.from_(item) for item in changes]
+
+    def __repr__(self):
+        return "DataChangeset(constants={}, changes={})".format(
+            repr(self.constants),
+            repr(self.changes),
+        )
 
     def joint_probability(self):
-        """
-        joint probability of this changeset (with the current values) occurring
-        assume data change events are independent
-        """
-        prob = 1
-        for change in self.changes:
-            prob *= change.item.probability(change.current_value)
-        return prob
+        return joint_probability(self.constants, self.changes)
 
     def importance(self):
-        """
-        importance is given by the total number of dependent function instances
-        of the associated changing items
-        """
-        dependent_fis = set()
-        for change in self.changes:
-            dependent_fis |= change.item.dependent_fi
-        return len(dependent_fis)
+        return importance(self.changes)
 
     def weight(self):
-        """
-        weight of this changeset taking the current values
-        """
-        return (
-            self.importance() * self.joint_probability()
-        )
+        return weight(self.constants, self.changes)
 
     def change(self):
         """
@@ -156,43 +203,62 @@ class DataChangeset(object):
 
         assert len(probabilities) == len(self.changes)
 
-        if probabilities:
+        if sum(probabilities) > 0:
             self.changes[probabilities.index(max(probabilities))].change()
-        return probabilities
+            return probabilities
+        return False
 
     @staticmethod
-    def important_datasets(fis, skip=set()):
+    def important_datasets(fis, data, skip=set()):
         """
         Yield datasets in decreasing order of importance,
         where *importance* is the number of dependent function instances
         skip: datasets to skip (not yield)
         """
 
-        def important_datasets_generator(fis):
+        def important_changesets_generator(fis):
             if len(fis) == 0:
                 yield frozenset()
             else:
-                # recursively generate datasets (sets of data items to change)
-                for dataset in important_datasets_generator(fis[1:]):
+                # recursively generate changesets
+                for changeset in important_changesets_generator(fis[1:]):
 
-                    # change data this function instance depends on
-                    for dependent_data_item in fis[0].data:
-                        yield frozenset(set({dependent_data_item}) | dataset)
+                    # goal: yield in decreasing order of
+                    # joint_probability(constants remaining current value)
+                    # * importance(other items changing)
 
+                    changesets = [
+                        # change data this function instance depends on
+                        frozenset(set({dependent_data_item}) | changeset)
+                        for dependent_data_item in fis[0].data
+                    ]
                     # exclude this function instance
-                    yield dataset
+                    changesets.append(changeset)
 
-        for dataset in important_datasets_generator(fis):
-            if dataset not in skip:
-                skip.add(dataset)
-                yield DataChangeset(dataset)
+                    changesets.sort(
+                        key=lambda changeset: (
+                            # probability that other items remain constant
+                            joint_probability(constants=(data - changeset))
+
+                            # importance of changing these items
+                            * importance(changeset)
+                        ),
+                        reverse=True,
+                    )
+                    for changeset in changesets:
+                        yield changeset
+
+        for changeset in important_changesets_generator(list(fis)):
+            if changeset not in skip:
+                skip.add(changeset)
+                yield DataChangeset(data - changeset, changeset)
 
     @classmethod
-    def generate(cls, fis):
+    def generate(cls, fis, data):
         """
         enumerate all possible permutations of changes on the data items
         """
-        dataset_iterator = cls.important_datasets(fis)
+        dataset_iterator = cls.important_datasets(fis, data)
         active_changesets = [next(dataset_iterator)]
 
         while len(active_changesets) > 0:
@@ -234,11 +300,20 @@ def construct_sample():
 
         items.append(d)
 
-    return fis
+    return frozenset(fis), frozenset(items)
 
 
 if __name__ == '__main__':
-    fis = construct_sample()
+    fis, data = construct_sample()
 
-    for changeset in DataChangeset.generate(fis):
-        print(changeset)
+    old_weight = -1
+    for changeset in DataChangeset.generate(fis, data):
+        print(
+            '{}: joint_probability={:.2E}, importance={}, '
+            'weight={:.2E}'.format(
+                repr(changeset),
+                changeset.joint_probability(),
+                changeset.importance(),
+                changeset.weight(),
+            )
+        )
