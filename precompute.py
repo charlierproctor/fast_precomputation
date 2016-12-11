@@ -1,4 +1,7 @@
 from contextlib import contextmanager
+import copy
+import math
+import networkx as nx
 import random
 from scipy.stats import binom
 
@@ -9,8 +12,9 @@ NUM_ITEMS = 3
 
 class FunctionInstance(object):
 
-    def __init__(self):
+    def __init__(self, idx):
         self._data = set()
+        self.idx = idx
 
     def depends_on(self, data_item):
         """
@@ -108,21 +112,15 @@ def weight(constants=None, changes=None):
     )
 
 
-class ChangedDataItem(DataItem):
+class ChangeableDataItem(DataItem):
 
     def __init__(self, idx, value):
-        super(ChangedDataItem, self).__init__(idx, value)
+        super(ChangeableDataItem, self).__init__(idx, value)
 
         self.change_idx = 0
 
-    @classmethod
-    def from_(cls, data_item):
-        obj = cls(data_item.idx, data_item.value)
-        obj.dependent_fi = data_item.dependent_fi
-        return obj
-
     def __repr__(self):
-        return "change(" + super(ChangedDataItem, self).__repr__() \
+        return "change(" + super(ChangeableDataItem, self).__repr__() \
             + " ==> " + str(self.changed_value) + ")"
 
     @property
@@ -131,6 +129,20 @@ class ChangedDataItem(DataItem):
         what is the current value of the associated item?
         """
         return self.possible_changes[self.change_idx]
+
+    @property
+    def prob_change(self):
+        """
+        what is the probability of the item taking it's current changed_value?
+        """
+        return self.probability(self.changed_value)
+
+    @property
+    def prob_const(self):
+        """
+        what is the probability of the item taking it's current changed_value?
+        """
+        return self.probability(self.value)
 
     @contextmanager
     def fake_change(self):
@@ -154,22 +166,125 @@ class ChangedDataItem(DataItem):
         self.change_idx += 1
 
 
-class DataChangeset(object):
+class ChangeableDataset(object):
 
-    def __init__(self, constants=None, changes=None):
-        constants = frozenset() if constants is None else constants
-        changes = frozenset() if changes is None else changes
+    def __init__(self, fis, items):
 
         # sanity checks: sets are disjoint and contain data items
-        assert constants.isdisjoint(changes)
-        for item in constants | changes:
-            assert isinstance(item, DataItem)
+        for item in items:
+            assert isinstance(item, ChangeableDataItem)
 
-        self.constants = constants
-        self.changes = [ChangedDataItem.from_(item) for item in changes]
+        self.fis = fis
+        self.ordered_fis = sorted(list(fis), key=lambda fi: fi.idx)
+
+        self.items = items
+        self.ordered_items = sorted(list(items), key=lambda item: item.idx)
 
     def __repr__(self):
-        return "DataChangeset(constants={}, changes={})".format(
+        return "ChangeableDataset(items={})".format(repr(self.items))
+
+    def change(self, items):
+        """
+        change this dataset to its next best possible values by mutating
+        one of the items specified
+        return "false" when no changes left to make
+        """
+        items = list(items)
+        probabilities = []
+
+        for item in items:
+            assert item in self.items
+            if item.can_change():
+
+                # fake the change (incrementing the change_idx)
+                with item.fake_change():
+
+                    # assess the joint probability of changing to new values
+                    probabilities.append(
+                        joint_probability(changes=items)
+                    )
+
+            else:
+                probabilities.append(0)
+
+        assert len(probabilities) == len(items)
+
+        if sum(probabilities) > 0:
+            items[probabilities.index(max(probabilities))].change()
+            return probabilities
+        return False
+
+    def construct_graph(self):
+        """
+        construct the corresponding nx.DiGraph()
+        """
+        graph = nx.DiGraph()
+
+        # data items connected to sink with weight abs(ln(prob_const))
+        for item in self.items:
+            capacity = abs(math.log(item.prob_const))
+            graph.add_edge('d' + str(item.idx), 't', capacity=capacity)
+
+        # source connected to fis with prob = min(abs(ln(prob_change)))
+        for fi in self.fis:
+            capacity = min(
+                abs(math.log(item.prob_change))
+                for item in fi.data
+            )
+            graph.add_edge('s', 'f' + str(fi.idx), capacity=capacity)
+
+            # connect fi to dependent data with effectively "infinite" weight
+            for item in self.items:
+                graph.add_edge(
+                    'f' + str(fi.idx),
+                    'd' + str(item.idx),
+                    capacity=100,
+                )
+
+        return graph
+
+    def cut(self):
+        """
+        perform min-cut and compute constants / changing data items
+        """
+        graph = self.construct_graph()
+
+        cut_value, partition = nx.minimum_cut(graph, 's', 't')
+        reachable, non_reachable = partition
+
+        # keep constant all reachable data items
+        constants = set()
+        for label in reachable:
+            if label[0] == 'd':
+                constants.add(self.ordered_items[int(label[1:])])
+
+        # the rest should change
+        changes = set(self.items) - constants
+        return constants, changes
+
+    def generate(self):
+        """
+        enumerate all possible permutations of changes on the data items
+        """
+
+        # while at least one data item can change
+        while sum(int(item.can_change()) for item in self.items) > 0:
+
+            constants, changes = self.cut()
+            dataset = FrozenDataset(constants, changes)
+            if dataset.weight() > 0:
+                yield dataset
+            self.change(changes)
+
+
+class FrozenDataset(object):
+
+    def __init__(self, constants, changes):
+        self.constants = copy.deepcopy(constants)
+        self.changes = copy.deepcopy(changes)
+
+    def __repr__(self):
+        return "FrozenDataset(constants={}, changes={})".format(
             repr(self.constants),
             repr(self.changes),
         )
@@ -183,139 +298,15 @@ class DataChangeset(object):
     def weight(self):
         return weight(self.constants, self.changes)
 
-    def change(self):
-        """
-        change this dataset to its next best possible values
-        return "false" when no changes left to make
-        """
-        probabilities = []
-        for item in self.changes:
-            if item.can_change():
-
-                # fake the change (incrementing the change_idx)
-                with item.fake_change():
-
-                    # assess the joint probability of changing to new values
-                    probabilities.append(
-                        joint_probability(changes=self.changes)
-                    )
-
-            else:
-                probabilities.append(0)
-
-        assert len(probabilities) == len(self.changes)
-
-        if sum(probabilities) > 0:
-            self.changes[probabilities.index(max(probabilities))].change()
-            return probabilities
-        return False
-
-    @staticmethod
-    def important_datasets(fis, data):
-        """
-        Yield datasets in decreasing order of changeset_weight
-        """
-
-        def changeset_weight(changeset):
-            return (
-                # probability that other items remain constant
-                joint_probability(constants=(data - changeset))
-
-                # importance of changing these items
-                * importance(changeset)
-            )
-
-        def important_changesets_generator(fis, depth=0):
-            if len(fis) == 0:
-                yield [frozenset()]
-                return
-
-            # recursively generate changesets
-            for changeset_group in important_changesets_generator(
-                fis[1:],
-                depth=depth + 1,
-            ):
-
-                # goal: yield in decreasing order of changeset_weight:
-                # joint_probability(constants remaining current value)
-                # * importance(other items changing)
-
-                changesets = [
-                    # change data this function instance depends on
-                    frozenset(set({dependent_data_item}) | changeset)
-                    for dependent_data_item in fis[0].data
-                    for changeset in changeset_group
-                ]
-                # exclude this function instance
-                changesets += list(changeset_group)
-
-                changesets.sort(key=changeset_weight, reverse=True)
-
-                # yield the changesets in groups of the same weight
-                to_yield = []
-                for changeset in changesets:
-                    if (
-                        len(to_yield) > 0
-                        and changeset_weight(changeset)
-                        < changeset_weight(to_yield[-1])
-                    ):
-                        yield set(to_yield)
-                        to_yield = []
-                    to_yield.append(changeset)
-                yield set(to_yield)
-
-        # skip changesets that have already been yielded
-        skip = set()
-        for changesets in important_changesets_generator(list(fis)):
-
-            changesets -= skip
-            skip |= changesets
-
-            yield frozenset([
-                DataChangeset(data - changeset, changeset)
-                for changeset in changesets
-            ])
-
-    @classmethod
-    def generate(cls, fis, data):
-        """
-        enumerate all possible permutations of changes on the data items
-        """
-        dataset_iterator = cls.important_datasets(fis, data)
-        active_changesets = list(next(dataset_iterator))
-
-        while len(active_changesets) > 0:
-
-            # find the changeset with the highest weight
-            weights = [
-                changeset.weight()
-                for changeset in active_changesets
-            ]
-            best_idx = weights.index(max(weights))
-            best_changeset = active_changesets[best_idx]
-
-            # don't yield changesets without any probability
-            if best_changeset.weight() > 0:
-                yield best_changeset
-
-            # if this is the last changeset, add more to the mix
-            if best_idx == len(active_changesets) - 1:
-                active_changesets += list(next(dataset_iterator))
-
-            # make another change to this changeset for the future
-            if not best_changeset.change():
-                # we've exhausted all changes for this changeset
-                active_changesets.remove(best_changeset)
-
 
 def construct_sample():
     # construct the function instances
-    fis = [FunctionInstance() for _ in range(NUM_FUNCTION_INSTANCES)]
+    fis = [FunctionInstance(i) for i in range(NUM_FUNCTION_INSTANCES)]
     items = []
 
     # construct the data items
     for i in range(NUM_ITEMS):
-        d = DataItem(i, random.randrange(MAX_VALUE))
+        d = ChangeableDataItem(i, random.randrange(MAX_VALUE))
 
         # depend on function instances [0, i)
         for f in range(i + 1):
@@ -327,10 +318,11 @@ def construct_sample():
 
 
 if __name__ == '__main__':
-    fis, data = construct_sample()
+    fis, items = construct_sample()
 
     old_weight = -1
-    for changeset in DataChangeset.generate(fis, data):
+    obj = ChangeableDataset(fis, items)
+    for changeset in obj.generate():
         print(
             '{}: joint_probability={:.2E}, importance={}, '
             'weight={:.2E}'.format(
