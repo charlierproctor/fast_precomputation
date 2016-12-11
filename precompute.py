@@ -20,8 +20,8 @@ class FunctionInstance(object):
         """
         mark this function instance as dependent on *data_item*
         """
-        self._data.add(data_item)
-        data_item.dependent_fi.add(self)
+        self._data.add(data_item.idx)
+        data_item.dependent_fi.add(self.idx)
 
     @property
     def data(self):
@@ -119,6 +119,9 @@ class ChangeableDataItem(DataItem):
 
         self.change_idx = 0
 
+    def reset(self):
+        self.change_idx = 0
+
     def __repr__(self):
         return "change(" + super(ChangeableDataItem, self).__repr__() \
             + " ==> " + str(self.changed_value) + ")"
@@ -173,6 +176,7 @@ class ChangeableDataset(object):
         # sanity checks: sets are disjoint and contain data items
         for item in items:
             assert isinstance(item, ChangeableDataItem)
+            item.reset()
 
         self.fis = fis
         self.ordered_fis = sorted(list(fis), key=lambda fi: fi.idx)
@@ -228,16 +232,16 @@ class ChangeableDataset(object):
         # source connected to fis with prob = min(abs(ln(prob_change)))
         for fi in self.fis:
             capacity = min(
-                abs(math.log(item.prob_change))
-                for item in fi.data
+                abs(math.log(self.ordered_items[idx].prob_change))
+                for idx in fi.data
             )
             graph.add_edge('s', 'f' + str(fi.idx), capacity=capacity)
 
             # connect fi to dependent data with effectively "infinite" weight
-            for item in self.items:
+            for item in fi.data:
                 graph.add_edge(
                     'f' + str(fi.idx),
-                    'd' + str(item.idx),
+                    'd' + str(item),
                     capacity=100,
                 )
 
@@ -267,11 +271,51 @@ class ChangeableDataset(object):
         enumerate all possible permutations of changes on the data items
         """
 
+        changed_items = set()
+
+        generators = []
+        results = []
+
+        def best_result():
+            if len(results) == 0:
+                return -1, None
+            result = max(results, key=lambda res: res.weight())
+            idx = results.index(result)
+            return idx, result
+
+        def generate_result(idx):
+            try:
+                results[idx] = next(generators[idx])
+            except StopIteration:
+                del results[idx]
+                del generators[idx]
+
         # while at least one data item can change
         while sum(int(item.can_change()) for item in self.items) > 0:
 
             constants, changes = self.cut()
+
+            # if new set of changed items, spawn a new ChangeableDataset
+            next_changed_items = set(c.idx for c in changes)
+            if len(changed_items) > 0 and next_changed_items != changed_items:
+                dataset = ChangeableDataset(
+                    fis=self.fis,
+                    items=copy.deepcopy(self.items),    # will be reset
+                )
+                generator = dataset.generate()
+                generators.append(generator)
+                results.append(next(generator))
+            changed_items = next_changed_items
+
             dataset = FrozenDataset(constants, changes)
+
+            # yield results from sub-datasets
+            idx, res = best_result()
+            while res is not None and res.weight() > dataset.weight():
+                yield res
+                generate_result(idx)
+                idx, res = best_result()
+
             if dataset.weight() > 0:
                 yield dataset
             self.change(changes)
@@ -317,6 +361,8 @@ def construct_sample():
     return frozenset(fis), frozenset(items)
 
 
+FP_MARGIN_OF_ERROR = 1.0 + 10 ** -8
+
 if __name__ == '__main__':
     fis, items = construct_sample()
 
@@ -333,5 +379,5 @@ if __name__ == '__main__':
             )
         )
         if old_weight > 0:
-            assert changeset.weight() <= old_weight
+            assert changeset.weight() <= FP_MARGIN_OF_ERROR * old_weight
         old_weight = changeset.weight()
