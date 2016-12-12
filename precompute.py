@@ -138,6 +138,8 @@ class ChangeableDataItem(DataItem):
         """
         what is the probability of the item taking it's current changed_value?
         """
+        if self.change_idx < 0:
+            return 0
         return self.probability(self.changed_value)
 
     @property
@@ -160,7 +162,7 @@ class ChangeableDataItem(DataItem):
         """
         whether this item has another change to assess
         """
-        return self.change_idx < len(self.possible_changes) - 1
+        return 0 <= self.change_idx < len(self.possible_changes) - 1
 
     def change(self):
         """
@@ -168,37 +170,34 @@ class ChangeableDataItem(DataItem):
         """
         self.change_idx += 1
 
+    def terminate(self):
+        """
+        done changing this object
+        note: the changed_value will now yield self.possible_changes[-1]
+        """
+        self.change_idx = -1
+
+    @property
+    def active(self):
+        return self.change_idx >= 0
+
 
 class ChangeableDataset(object):
 
-    def __init__(self, fis, changes=None, constants=None):
+    def __init__(self, fis, changes=None):
 
-        constants = set() if constants is None else set(constants)
         changes = set() if changes is None else set(changes)
 
         # sanity checks: sets are disjoint and contain data items
-        assert constants.isdisjoint(changes)
-        for item in constants | changes:
+        for item in changes:
             assert isinstance(item, ChangeableDataItem)
 
-        # reset changes in case of recursive dataset
-        for item in changes:
-            item.reset()
-
-        # fis, constants, changes are dicts mapping from idx -> obj
+        # fis, changes are dicts mapping from idx -> obj
         self.fis = {fi.idx: fi for fi in fis}
-        self.constants = {item.idx: item for item in constants}
         self.changes = {item.idx: item for item in changes}
 
-    @property
-    def items(self):
-        """
-        union of the two dictionaries
-        """
-        return dict(list(self.constants.items()) + list(self.changes.items()))
-
     def __repr__(self):
-        return "ChangeableDataset(items={})".format(repr(self.items))
+        return "ChangeableDataset(items={})".format(repr(self.changes))
 
     def change(self, indices):
         """
@@ -229,6 +228,7 @@ class ChangeableDataset(object):
                     )
 
             else:
+                item.terminate()
                 probabilities.append((None, 0))
 
         assert len(probabilities) == len(indices)
@@ -256,7 +256,12 @@ class ChangeableDataset(object):
             if len(changeable_fi_deps) == 0:
                 continue
             capacity = min(
-                abs(math.log(self.changes[idx].prob_change))
+                (
+                    abs(math.log(self.changes[idx].prob_change))
+
+                    # effectively infinite weight when inactive
+                    if self.changes[idx].active else 100
+                )
                 for idx in changeable_fi_deps
             )
             graph.add_edge('s', 'f' + str(idx), capacity=capacity)
@@ -286,89 +291,41 @@ class ChangeableDataset(object):
             if label[0] == 'd':
                 new_constants.add(int(label[1:]))
 
-        assert new_constants.isdisjoint(self.constants)
-        new_constants |= self.constants.keys()
-
         # the rest should change
         new_changes = self.changes.keys() - new_constants
         return ({
-            idx: self.items[idx]
+            idx: self.changes[idx]
             for idx in new_constants
         }, {
-            idx: self.items[idx]
+            idx: self.changes[idx]
             for idx in new_changes
         })
-
-    class WrappedGenerator(object):
-
-        def __init__(self, dataset, generator):
-            self.dataset = dataset
-            self.generator = generator
-            self.next()
-
-        @property
-        def value(self):
-            return self.value
-
-        def next(self):
-            try:
-                self.value = next(self.generator)
-            except StopIteration:
-                self.value = None
-            return self.value
 
     def generate(self):
         """
         enumerate all possible permutations of changes on the data items
         """
 
+        already_generated = set()
+
         # while at least one data item can change
         while sum(int(i.can_change()) for i in self.changes.values()) > 0:
 
             new_constants, new_changes = self.cut()
-
-            # if new set of changed items, spawn a new ChangeableDataset
-            if new_changes.keys() != self.changes.keys():
-
-                dataset = ChangeableDataset(
-                    fis=self.fis.values(),
-                    constants=copy.deepcopy(list(new_constants.values())),
-                    changes=copy.deepcopy(list(new_changes.values())),
-                )
-                yield dataset
 
             dataset = FrozenDataset(
                 list(new_constants.values()),
                 list(new_changes.values()),
             )
 
+            # hash the dataset and remember that we've already yielded it
+            ds_hsh = hash(dataset)
+            if ds_hsh not in already_generated and dataset.weight() > 0:
+                yield dataset
+            already_generated.add(ds_hsh)
+
+            # perform the change
             self.change(set(new_changes.keys()))
-
-    @classmethod
-    def generate_all(cls, fis, items):
-
-        generators = []
-
-        initial_ds = ChangeableDataset(fis, changes=items)
-        generators.append(
-            cls.WrappedGenerator(initial_ds, initial_ds.generate())
-        )
-
-        while len(generators) > 0:
-
-            best_generator = max(
-                generators,
-                key=lambda gen: gen.value.weight()
-            )
-            ds = best_generator.value
-
-            if isinstance(ds, ChangeableDataset):
-                generators.append(ds, ds.generate())
-            else:
-                yield ds
-
-            best_generator.next()
-            generators = filter(generators, lambda gen: gen.value is not None)
 
 
 class FrozenDataset(object):
@@ -382,6 +339,16 @@ class FrozenDataset(object):
             repr(self.constants),
             repr(self.changes),
         )
+
+    def __hash__(self):
+        return hash((
+            frozenset([
+                (i.idx, i.value) for i in self.constants
+            ]),
+            frozenset([
+                (i.idx, i.changed_value) for i in self.changes
+            ])
+        ))
 
     def joint_probability(self):
         return joint_probability(self.constants, self.changes)
@@ -429,7 +396,5 @@ if __name__ == '__main__':
             )
         )
         if old_weight > 0:
-            if not changeset.weight() <= FP_MARGIN_OF_ERROR * old_weight:
-                print(changeset.weight(), old_weight)
-                exit(1)
+            assert changeset.weight() <= FP_MARGIN_OF_ERROR * old_weight
         old_weight = changeset.weight()
