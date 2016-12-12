@@ -320,7 +320,10 @@ class ChangeableDataset(object):
             ds_hsh = hash(dataset)
             if ds_hsh not in already_generated:
                 already_generated.add(ds_hsh)
-                yield dataset
+
+                # don't yield zero-weighted datasets
+                if dataset.weight() > 0:
+                    yield dataset
 
             # perform the change: when false, we're done!
             if not self.change(
@@ -363,15 +366,17 @@ class ChangeableDataset(object):
 
         while len(generators) > 0:
 
+            # yield from the best generator (with the current highest weight)
             best_generator = max(
                 generators,
                 key=lambda gen: gen.value.weight(),
             )
             ds = best_generator.value
+            assert hash(ds) in already_generated
 
             yield ds
 
-            # remember old state
+            # remember old state (before self.change is called)
             old_ds = cls.from_frozen_ds(fis, ds)
             generators.append(
                 cls.WrappedGenerator(
