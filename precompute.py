@@ -324,8 +324,9 @@ class ChangeableDataset(object):
                 yield dataset
             already_generated.add(ds_hsh)
 
-            # perform the change
-            self.change(set(new_changes.keys()))
+            # perform the change: when false, we're done!
+            if not self.change(set(new_changes.keys())):
+                return
 
 
 class FrozenDataset(object):
