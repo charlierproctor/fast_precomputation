@@ -299,25 +299,28 @@ class ChangeableDataset(object):
             for idx in new_changes
         })
 
+    class WrappedGenerator(object):
+
+        def __init__(self, dataset, generator):
+            self.dataset = dataset
+            self.generator = generator
+            self.next()
+
+        @property
+        def value(self):
+            return self.value
+
+        def next(self):
+            try:
+                self.value = next(self.generator)
+            except StopIteration:
+                self.value = None
+            return self.value
+
     def generate(self):
         """
         enumerate all possible permutations of changes on the data items
         """
-
-        generators = []
-        results = []
-
-        def best_result():
-            if len(results) == 0:
-                return -1, None
-            return max(enumerate(results), key=lambda tup: tup[1].weight())
-
-        def generate_result(idx):
-            try:
-                results[idx] = next(generators[idx])
-            except StopIteration:
-                del results[idx]
-                del generators[idx]
 
         # while at least one data item can change
         while sum(int(i.can_change()) for i in self.changes.values()) > 0:
@@ -332,25 +335,40 @@ class ChangeableDataset(object):
                     constants=copy.deepcopy(list(new_constants.values())),
                     changes=copy.deepcopy(list(new_changes.values())),
                 )
-                generator = dataset.generate()
-                generators.append(generator)
-                results.append(next(generator))
+                yield dataset
 
             dataset = FrozenDataset(
                 list(new_constants.values()),
                 list(new_changes.values()),
             )
 
-            # yield results from sub-datasets
-            idx, res = best_result()
-            while res is not None and res.weight() > dataset.weight():
-                yield res
-                generate_result(idx)
-                idx, res = best_result()
-
-            if dataset.weight() > 0:
-                yield dataset
             self.change(set(new_changes.keys()))
+
+    @classmethod
+    def generate_all(cls, fis, items):
+
+        generators = []
+
+        initial_ds = ChangeableDataset(fis, changes=items)
+        generators.append(
+            cls.WrappedGenerator(initial_ds, initial_ds.generate())
+        )
+
+        while len(generators) > 0:
+
+            best_generator = max(
+                generators,
+                key=lambda gen: gen.value.weight()
+            )
+            ds = best_generator.value
+
+            if isinstance(ds, ChangeableDataset):
+                generators.append(ds, ds.generate())
+            else:
+                yield ds
+
+            best_generator.next()
+            generators = filter(generators, lambda gen: gen.value is not None)
 
 
 class FrozenDataset(object):
@@ -411,5 +429,7 @@ if __name__ == '__main__':
             )
         )
         if old_weight > 0:
-            assert changeset.weight() <= FP_MARGIN_OF_ERROR * old_weight
+            if not changeset.weight() <= FP_MARGIN_OF_ERROR * old_weight:
+                print(changeset.weight(), old_weight)
+                exit(1)
         old_weight = changeset.weight()
