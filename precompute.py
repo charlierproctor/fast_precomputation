@@ -199,39 +199,39 @@ class ChangeableDataset(object):
     def __repr__(self):
         return "ChangeableDataset(items={})".format(repr(self.changes))
 
-    def change(self, indices):
+    def change(self, constants, changes, already_generated):
         """
         change this dataset to its next best possible values by mutating
         one of the items specified
         return "false" when no changes left to make
         """
-        assert indices <= set(self.changes.keys())
-
-        indices = list(indices)
         probabilities = []
 
-        for idx in indices:
-            item = self.changes[idx]
+        for item in changes:
             if item.can_change():
 
                 # fake the change (incrementing the change_idx)
                 with item.fake_change():
 
+                    # make sure we haven't already generated this changeset
+                    fake_ds = FrozenDataset(
+                        changes=changes,
+                        constants=constants,
+                    )
+                    if hash(fake_ds) in already_generated:
+                        continue
+
                     # assess the joint probability of changing to new values
                     probabilities.append(
                         (
                             item,
-                            joint_probability(changes=[
-                                self.changes[idx] for idx in indices
-                            ])
+                            joint_probability(changes=changes)
                         )
                     )
 
             else:
                 item.terminate()
                 probabilities.append((None, 0))
-
-        assert len(probabilities) == len(indices)
 
         if sum(prob for _, prob in probabilities) > 0:
             best_item, _ = max(probabilities, key=lambda tup: tup[1])
@@ -301,12 +301,10 @@ class ChangeableDataset(object):
             for idx in new_changes
         })
 
-    def generate(self):
+    def generate(self, already_generated):
         """
         enumerate all possible permutations of changes on the data items
         """
-
-        already_generated = set()
 
         # while at least one data item can change
         while sum(int(i.can_change()) for i in self.changes.values()) > 0:
@@ -320,13 +318,75 @@ class ChangeableDataset(object):
 
             # hash the dataset and remember that we've already yielded it
             ds_hsh = hash(dataset)
-            if ds_hsh not in already_generated and dataset.weight() > 0:
+            if ds_hsh not in already_generated:
+                already_generated.add(ds_hsh)
                 yield dataset
-            already_generated.add(ds_hsh)
 
             # perform the change: when false, we're done!
-            if not self.change(set(new_changes.keys())):
+            if not self.change(
+                set(new_constants.values()),
+                set(new_changes.values()),
+                already_generated,
+            ):
                 return
+
+    @classmethod
+    def from_frozen_ds(cls, fis, frozen_ds):
+        return cls(fis, frozen_ds.constants + frozen_ds.changes)
+
+    class WrappedGenerator(object):
+
+        def __init__(self, dataset, generator):
+            self.dataset = dataset
+            self.generator = generator
+            self.next()
+
+        def next(self):
+            try:
+                self.value = next(self.generator)
+            except StopIteration:
+                self.value = None
+            return self.value
+
+    @classmethod
+    def generate_all(cls, fis, items):
+
+        already_generated = set()
+
+        initial_ds = cls(fis=fis, changes=items)
+        generators = [
+            cls.WrappedGenerator(
+                initial_ds,
+                initial_ds.generate(already_generated),
+            )
+        ]
+
+        while len(generators) > 0:
+
+            best_generator = max(
+                generators,
+                key=lambda gen: gen.value.weight(),
+            )
+            ds = best_generator.value
+
+            yield ds
+
+            # remember old state
+            old_ds = cls.from_frozen_ds(fis, ds)
+            generators.append(
+                cls.WrappedGenerator(
+                    old_ds,
+                    old_ds.generate(already_generated),
+                )
+            )
+
+            # transition best_generator to new state
+            best_generator.next()
+
+            # filter dead generators
+            generators = list(
+                filter(lambda gen: gen.value is not None, generators)
+            )
 
 
 class FrozenDataset(object):
@@ -385,8 +445,7 @@ if __name__ == '__main__':
     fis, items = construct_sample()
 
     old_weight = -1
-    obj = ChangeableDataset(fis, changes=items)
-    for changeset in obj.generate():
+    for changeset in ChangeableDataset.generate_all(fis, items):
         print(
             '{}: joint_probability={:.2E}, importance={}, '
             'weight={:.2E}'.format(
