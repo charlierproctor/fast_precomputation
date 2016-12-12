@@ -171,33 +171,48 @@ class ChangeableDataItem(DataItem):
 
 class ChangeableDataset(object):
 
-    def __init__(self, fis, items):
+    def __init__(self, fis, changes=None, constants=None):
+
+        constants = set() if constants is None else set(constants)
+        changes = set() if changes is None else set(changes)
 
         # sanity checks: sets are disjoint and contain data items
-        for item in items:
+        assert constants.isdisjoint(changes)
+        for item in constants | changes:
             assert isinstance(item, ChangeableDataItem)
+
+        # reset changes in case of recursive dataset
+        for item in changes:
             item.reset()
 
-        self.fis = fis
-        self.ordered_fis = sorted(list(fis), key=lambda fi: fi.idx)
+        # fis, constants, changes are dicts mapping from idx -> obj
+        self.fis = {fi.idx: fi for fi in fis}
+        self.constants = {item.idx: item for item in constants}
+        self.changes = {item.idx: item for item in changes}
 
-        self.items = items
-        self.ordered_items = sorted(list(items), key=lambda item: item.idx)
+    @property
+    def items(self):
+        """
+        union of the two dictionaries
+        """
+        return dict(list(self.constants.items()) + list(self.changes.items()))
 
     def __repr__(self):
         return "ChangeableDataset(items={})".format(repr(self.items))
 
-    def change(self, items):
+    def change(self, indices):
         """
         change this dataset to its next best possible values by mutating
         one of the items specified
         return "false" when no changes left to make
         """
-        items = list(items)
+        assert indices <= set(self.changes.keys())
+
+        indices = list(indices)
         probabilities = []
 
-        for item in items:
-            assert item in self.items
+        for idx in indices:
+            item = self.changes[idx]
             if item.can_change():
 
                 # fake the change (incrementing the change_idx)
@@ -205,17 +220,23 @@ class ChangeableDataset(object):
 
                     # assess the joint probability of changing to new values
                     probabilities.append(
-                        joint_probability(changes=items)
+                        (
+                            item,
+                            joint_probability(changes=[
+                                self.changes[idx] for idx in indices
+                            ])
+                        )
                     )
 
             else:
-                probabilities.append(0)
+                probabilities.append((None, 0))
 
-        assert len(probabilities) == len(items)
+        assert len(probabilities) == len(indices)
 
-        if sum(probabilities) > 0:
-            items[probabilities.index(max(probabilities))].change()
-            return probabilities
+        if sum(prob for _, prob in probabilities) > 0:
+            best_item, _ = max(probabilities, key=lambda tup: tup[1])
+            best_item.change()
+            return True
         return False
 
     def construct_graph(self):
@@ -225,22 +246,25 @@ class ChangeableDataset(object):
         graph = nx.DiGraph()
 
         # data items connected to sink with weight abs(ln(prob_const))
-        for item in self.items:
+        for idx, item in self.changes.items():
             capacity = abs(math.log(item.prob_const))
-            graph.add_edge('d' + str(item.idx), 't', capacity=capacity)
+            graph.add_edge('d' + str(idx), 't', capacity=capacity)
 
         # source connected to fis with prob = min(abs(ln(prob_change)))
-        for fi in self.fis:
+        for idx, fi in self.fis.items():
+            changeable_fi_deps = fi.data & set(self.changes.keys())
+            if len(changeable_fi_deps) == 0:
+                continue
             capacity = min(
-                abs(math.log(self.ordered_items[idx].prob_change))
-                for idx in fi.data
+                abs(math.log(self.changes[idx].prob_change))
+                for idx in changeable_fi_deps
             )
-            graph.add_edge('s', 'f' + str(fi.idx), capacity=capacity)
+            graph.add_edge('s', 'f' + str(idx), capacity=capacity)
 
             # connect fi to dependent data with effectively "infinite" weight
-            for item in fi.data:
+            for item in changeable_fi_deps:
                 graph.add_edge(
-                    'f' + str(fi.idx),
+                    'f' + str(idx),
                     'd' + str(item),
                     capacity=100,
                 )
@@ -257,21 +281,28 @@ class ChangeableDataset(object):
         reachable, non_reachable = partition
 
         # keep constant all reachable data items
-        constants = set()
+        new_constants = set()
         for label in reachable:
             if label[0] == 'd':
-                constants.add(self.ordered_items[int(label[1:])])
+                new_constants.add(int(label[1:]))
+
+        assert new_constants.isdisjoint(self.constants)
+        new_constants |= self.constants.keys()
 
         # the rest should change
-        changes = set(self.items) - constants
-        return constants, changes
+        new_changes = self.changes.keys() - new_constants
+        return ({
+            idx: self.items[idx]
+            for idx in new_constants
+        }, {
+            idx: self.items[idx]
+            for idx in new_changes
+        })
 
     def generate(self):
         """
         enumerate all possible permutations of changes on the data items
         """
-
-        changed_items = set()
 
         generators = []
         results = []
@@ -279,9 +310,7 @@ class ChangeableDataset(object):
         def best_result():
             if len(results) == 0:
                 return -1, None
-            result = max(results, key=lambda res: res.weight())
-            idx = results.index(result)
-            return idx, result
+            return max(enumerate(results), key=lambda tup: tup[1].weight())
 
         def generate_result(idx):
             try:
@@ -291,23 +320,26 @@ class ChangeableDataset(object):
                 del generators[idx]
 
         # while at least one data item can change
-        while sum(int(item.can_change()) for item in self.items) > 0:
+        while sum(int(i.can_change()) for i in self.changes.values()) > 0:
 
-            constants, changes = self.cut()
+            new_constants, new_changes = self.cut()
 
             # if new set of changed items, spawn a new ChangeableDataset
-            next_changed_items = set(c.idx for c in changes)
-            if len(changed_items) > 0 and next_changed_items != changed_items:
+            if new_changes.keys() != self.changes.keys():
+
                 dataset = ChangeableDataset(
-                    fis=self.fis,
-                    items=copy.deepcopy(self.items),    # will be reset
+                    fis=self.fis.values(),
+                    constants=copy.deepcopy(list(new_constants.values())),
+                    changes=copy.deepcopy(list(new_changes.values())),
                 )
                 generator = dataset.generate()
                 generators.append(generator)
                 results.append(next(generator))
-            changed_items = next_changed_items
 
-            dataset = FrozenDataset(constants, changes)
+            dataset = FrozenDataset(
+                list(new_constants.values()),
+                list(new_changes.values()),
+            )
 
             # yield results from sub-datasets
             idx, res = best_result()
@@ -318,7 +350,7 @@ class ChangeableDataset(object):
 
             if dataset.weight() > 0:
                 yield dataset
-            self.change(changes)
+            self.change(set(new_changes.keys()))
 
 
 class FrozenDataset(object):
@@ -367,7 +399,7 @@ if __name__ == '__main__':
     fis, items = construct_sample()
 
     old_weight = -1
-    obj = ChangeableDataset(fis, items)
+    obj = ChangeableDataset(fis, changes=items)
     for changeset in obj.generate():
         print(
             '{}: joint_probability={:.2E}, importance={}, '
